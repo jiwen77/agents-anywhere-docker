@@ -1,14 +1,15 @@
+
 name: Build Agents Anywhere Server
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Upstream official release tag
-        required: true
-        default: v2.0.3
+        description: "Official release tag (blank = latest)"
+        required: false
+        default: ""
   schedule:
-    - cron: '17 5 * * *' # UTC: check the latest official release daily
+    - cron: "17 5 * * *"
 
 permissions:
   contents: read
@@ -22,8 +23,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     steps:
-      - name: Resolve official release tag and image name
+      - name: Resolve official release
         id: vars
         shell: bash
         env:
@@ -32,46 +34,63 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          if [[ -n "$INPUT_TAG" ]]; then
-            tag="$INPUT_TAG"
-          else
-            tag="$(gh api repos/anywhere-labs/Agents-Anywhere/releases/latest --jq '.tag_name')"
-          fi
+
+          latest_tag="$(gh api repos/anywhere-labs/Agents-Anywhere/releases/latest --jq '.tag_name')"
+          tag="${INPUT_TAG:-$latest_tag}"
+
           if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Unsupported release tag: $tag"
             exit 1
           fi
+
           owner_lower="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/$owner_lower/agents-anywhere-server"
+
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/$owner_lower/agents-anywhere-server" >> "$GITHUB_OUTPUT"
-          echo "Building upstream $tag"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+          if [[ "$tag" == "$latest_tag" ]]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+            echo "image_tags=$image:$tag,$image:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            echo "image_tags=$image:$tag" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Skip versions already published
+      - name: Check existing image
         id: existing
         shell: bash
         env:
           IMAGE: ${{ steps.vars.outputs.image }}
           TAG: ${{ steps.vars.outputs.tag }}
         run: |
-          if docker buildx imagetools inspect "$IMAGE:$TAG" > /dev/null 2>&1; then
-            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Image already exists: $IMAGE:$TAG"
           else
-            echo 'skip=false' >> "$GITHUB_OUTPUT"
-            echo "Image not found, will build: $IMAGE:$TAG"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Check out upstream source at official release tag
+      - name: Update latest from existing image
+        if: steps.existing.outputs.skip == 'true' && steps.vars.outputs.is_latest == 'true'
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:latest" "$IMAGE:$TAG"
+
+      - name: Checkout upstream release
         if: steps.existing.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
@@ -80,7 +99,7 @@ jobs:
           path: source
           persist-credentials: false
 
-      - name: Build and push server image
+      - name: Build and push image
         if: steps.existing.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
@@ -89,9 +108,9 @@ jobs:
           target: server
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
+          tags: ${{ steps.vars.outputs.image_tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=Agents Anywhere server from upstream release
+            org.opencontainers.image.description=Agents Anywhere server
           cache-from: type=gha
           cache-to: type=gha,mode=min
